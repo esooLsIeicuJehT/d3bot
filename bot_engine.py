@@ -1,0 +1,169 @@
+"""
+Bot Engine — orchestrates all features via the shared BotState context.
+Runs the main loop in a daemon thread; the GUI observes via EventBus.
+"""
+
+from __future__ import annotations
+import time
+import threading
+import logging
+
+import config
+from core.state import BotState, BotPhase
+from core.event_bus import EventBus, bus
+
+from io.screen_capture import ScreenCapture
+from io.image_recognizer import ImageRecognizer
+from io.input_controller import InputController
+
+from features.health_monitor import HealthMonitor
+from features.resource_monitor import ResourceMonitor
+from features.skill_rotation import SkillRotation
+from features.loot_collector import LootCollector
+from features.death_handler import DeathHandler
+from features.goblin_detector import GoblinDetector
+from features.anti_afk import AntiAFK
+
+from tools.profiler import Profiler
+from tools.event_replay_logger import EventReplayLogger
+
+
+log = logging.getLogger("d3bot.engine")
+
+
+class BotEngine:
+    """
+    Context Flow entry point.
+    Wires the IO layer → features → shared state.
+    Optionally wraps all features in the Profiler for timing analysis.
+    """
+
+    def __init__(self, state: BotState, enable_profiler: bool = False,
+                 enable_event_log: bool = True, input_override=None):
+        self.state = state
+
+        # IO layer
+        self._capture    = ScreenCapture()
+        self._recognizer = ImageRecognizer(self._capture)
+        self._input      = input_override if input_override is not None else InputController()
+
+        # Optional instrumentation
+        self._profiler   = Profiler() if enable_profiler else None
+        self._event_log  = EventReplayLogger() if enable_event_log else None
+
+        def _maybe_wrap(name, feature):
+            if self._profiler:
+                return self._profiler.wrap(name, feature)
+            return feature
+
+        # Features — wrapped transparently if profiling enabled
+        self._health   = _maybe_wrap("HealthMonitor",   HealthMonitor(state, self._recognizer, self._input))
+        self._resource = _maybe_wrap("ResourceMonitor", ResourceMonitor(state, self._recognizer))
+        self._skills   = _maybe_wrap("SkillRotation",   SkillRotation(state, self._input))
+        self._loot     = _maybe_wrap("LootCollector",   LootCollector(state, self._recognizer, self._input))
+        self._death    = _maybe_wrap("DeathHandler",    DeathHandler(state, self._recognizer, self._input))
+        self._goblin   = _maybe_wrap("GoblinDetector",  GoblinDetector(state, self._recognizer))
+        self._afk      = _maybe_wrap("AntiAFK",         AntiAFK(state, self._input))
+
+        self._thread: threading.Thread | None = None
+        self._status_timer = time.time()
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self):
+        if self.state.get_phase() != BotPhase.IDLE:
+            return
+        self.state.set_phase(BotPhase.RUNNING)
+        if self._event_log:
+            self._event_log.start()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="BotEngine")
+        self._thread.start()
+        bus.publish(EventBus.BOT_STARTED)
+        log.info("Bot engine started  [profiler=%s, event_log=%s]",
+                 bool(self._profiler), bool(self._event_log))
+
+    def stop(self):
+        self.state.set_phase(BotPhase.STOPPING)
+        self._input.emergency_stop()
+        if self._event_log:
+            self._event_log.stop()
+        if self._profiler:
+            self._profiler.print_report()
+        bus.publish(EventBus.BOT_STOPPED)
+        log.info("Bot engine stopped. Runtime: %s", self.state.stats.elapsed_str())
+
+    def get_profiler_report(self) -> list[dict]:
+        """Return current profiler stats for the GUI."""
+        return self._profiler.report() if self._profiler else []
+
+    def pause(self):
+        if self.state.get_phase() == BotPhase.RUNNING:
+            self.state.set_phase(BotPhase.PAUSED)
+            log.info("Bot paused")
+
+    def resume(self):
+        if self.state.get_phase() == BotPhase.PAUSED:
+            self.state.set_phase(BotPhase.RUNNING)
+            log.info("Bot resumed")
+
+    def update_skills(self, skills):
+        self._skills.update_skills(skills)
+
+    def take_screenshot(self) -> str:
+        return self._capture.save_screenshot()
+
+    # ── Main Loop ─────────────────────────────────────────────────────────────
+
+    def _loop(self):
+        while True:
+            phase = self.state.get_phase()
+
+            if phase == BotPhase.STOPPING:
+                break
+
+            if phase == BotPhase.PAUSED:
+                time.sleep(0.2)
+                continue
+
+            # Check runtime limit
+            if self.state.stats.elapsed() > config.MAX_RUNTIME_MINUTES * 60:
+                log.info("Runtime limit reached — stopping")
+                bus.publish(EventBus.RUNTIME_LIMIT)
+                self.stop()
+                break
+
+            try:
+                self._tick()
+            except Exception as exc:
+                log.error("Tick error: %s", exc, exc_info=True)
+                time.sleep(0.5)
+
+            time.sleep(config.LOOP_INTERVAL)
+
+    def _tick(self):
+        self.state.stats.loops += 1
+        phase = self.state.get_phase()
+
+        # Death detection runs always when bot is active
+        self._death.tick()
+
+        if phase not in (BotPhase.RUNNING,):
+            return
+
+        # Sensor layer
+        self._health.tick()
+        self._resource.tick()
+        self._goblin.tick()
+
+        # Action layer — only act if we have enough resources
+        has_res = self._resource.has_resource
+        self._skills.tick(resource_available=has_res)
+        self._loot.tick()
+        self._afk.tick()
+
+        # Periodic status broadcast
+        now = time.time()
+        if now - self._status_timer >= config.STATUS_LOG_INTERVAL:
+            self._status_timer = now
+            bus.publish(EventBus.STATUS_UPDATE, self.state.snapshot())
+            log.info("Status: %s", self.state.snapshot()["stats"])

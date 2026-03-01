@@ -1,0 +1,830 @@
+"""
+D3 Bot — Main GUI  (Tabbed, fully wired)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Tabs:
+  ① Control       — start/stop/pause, vitals bars, live stats
+  ② Features      — per-feature toggles + threshold sliders
+  ③ Skills        — skill row editor + class build presets
+  ④ Regions       — drag-to-set detection zones on live screenshot
+  ⑤ Tools         — launch calibrator / visualizer / template capture
+  ⑥ Log           — full event log + profiler readout
+
+Overlay HUD: transparent always-on-top floating window over the game.
+Dry Run mode: replaces InputController with a logger — no real inputs.
+"""
+
+from __future__ import annotations
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, filedialog
+from tkinter.simpledialog import askstring
+import threading
+import time
+import logging
+import sys
+import os
+import subprocess
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import config
+from core.state import BotState, BotPhase
+from core.event_bus import EventBus, bus
+from core.bot_engine import BotEngine
+
+from gui.overlay_hud   import OverlayHUD
+from gui.region_editor import RegionEditor
+from gui.build_presets import PRESETS, list_presets, apply_preset
+from gui.dry_run       import DryRunController, DRYRUN_EVENT
+from tools.config_profiles import ProfileManager
+
+# ── Palette ───────────────────────────────────────────────────────────────────
+DARK_BG  = "#1a1a2e"
+PANEL_BG = "#16213e"
+ACCENT   = "#e94560"
+ACCENT2  = "#0f3460"
+TEXT_FG  = "#eaeaea"
+DIM_FG   = "#888888"
+GREEN    = "#00d68f"
+ORANGE   = "#ffa726"
+RED      = "#ef5350"
+BAR_BG   = "#0d0d1a"
+YELLOW   = "#ffe082"
+
+FONT_TITLE = ("Courier New", 14, "bold")
+FONT_H2    = ("Courier New", 11, "bold")
+FONT_MONO  = ("Courier New", 10)
+FONT_SMALL = ("Courier New", 9)
+FONT_LOG   = ("Courier New", 9)
+
+
+# ── Widget helpers ────────────────────────────────────────────────────────────
+def frm(parent, **kw):
+    return tk.Frame(parent, bg=PANEL_BG, **kw)
+
+def lbl(parent, text, font=FONT_MONO, fg=TEXT_FG, **kw):
+    return tk.Label(parent, text=text, font=font, fg=fg, bg=parent["bg"], **kw)
+
+def mkbtn(parent, text, cmd, w=16, color=ACCENT2, fg=TEXT_FG):
+    return tk.Button(parent, text=text, command=cmd, font=FONT_SMALL,
+                     bg=color, fg=fg, activebackground=DARK_BG, activeforeground=ACCENT,
+                     relief="flat", width=w, cursor="hand2", padx=4)
+
+
+class ProgressBar(tk.Canvas):
+    def __init__(self, parent, width=260, height=20, **kw):
+        super().__init__(parent, width=width, height=height, bg=BAR_BG,
+                         highlightthickness=1, highlightbackground=ACCENT2, **kw)
+        self._w   = width
+        self._bar = self.create_rectangle(0, 0, 0, height, fill=GREEN, outline="")
+        self._txt = self.create_text(width // 2, height // 2, text="—",
+                                     fill=TEXT_FG, font=FONT_SMALL)
+
+    def set(self, pct):
+        if pct is None:
+            self.itemconfig(self._txt, text="N/A")
+            self.coords(self._bar, 0, 0, 0, self["height"])
+            return
+        w = int(self._w * max(0.0, min(1.0, pct)))
+        c = GREEN if pct > 0.5 else (ORANGE if pct > 0.25 else RED)
+        self.coords(self._bar, 0, 0, w, self["height"])
+        self.itemconfig(self._bar, fill=c)
+        self.itemconfig(self._txt, text=f"{pct*100:.1f}%")
+
+
+class SkillRow(tk.Frame):
+    def __init__(self, parent, idx, key="1", cd=0.0, label_text="Skill"):
+        super().__init__(parent, bg=PANEL_BG)
+        self.idx = idx
+        lbl(self, f"#{idx+1}", font=FONT_SMALL, fg=DIM_FG, width=3).pack(side="left")
+        self.key_var = tk.StringVar(value=key)
+        self.cd_var  = tk.StringVar(value=str(cd))
+        self.lbl_var = tk.StringVar(value=label_text)
+        for var, w in [(self.key_var, 4), (self.cd_var, 7), (self.lbl_var, 20)]:
+            e = tk.Entry(self, textvariable=var, width=w, font=FONT_SMALL,
+                         bg=BAR_BG, fg=TEXT_FG, insertbackground=TEXT_FG,
+                         relief="flat", highlightthickness=1, highlightbackground=ACCENT2)
+            e.pack(side="left", padx=2)
+
+    def get(self):
+        try:    cd = float(self.cd_var.get())
+        except: cd = 0.0
+        return (self.key_var.get(), cd, self.lbl_var.get())
+
+    def set_values(self, key, cd, label_text):
+        self.key_var.set(key)
+        self.cd_var.set(str(cd))
+        self.lbl_var.set(label_text)
+
+
+class GuiLogHandler(logging.Handler):
+    def __init__(self, widget):
+        super().__init__()
+        self._w = widget
+
+    def emit(self, record):
+        msg   = self.format(record)
+        color = {"DEBUG": DIM_FG, "INFO": TEXT_FG,
+                 "WARNING": ORANGE, "ERROR": RED}.get(record.levelname, TEXT_FG)
+        try:
+            self._w.configure(state="normal")
+            self._w.insert(tk.END, msg + "\n", record.levelname)
+            self._w.tag_config(record.levelname, foreground=color)
+            self._w.see(tk.END)
+            self._w.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+class D3BotApp:
+    def __init__(self):
+        self.state  = BotState()
+        self.engine: BotEngine | None = None
+        self._overlay: OverlayHUD | None = None
+
+        self._root = tk.Tk()
+        self._root.title("D3 Bot Framework — Educational Research Tool")
+        self._root.configure(bg=DARK_BG)
+        self._root.geometry("1120x800")
+        self._root.minsize(960, 700)
+
+        self._dry_run       = tk.BooleanVar(value=False)
+        self._enable_prof   = tk.BooleanVar(value=False)
+        self._enable_evtlog = tk.BooleanVar(value=True)
+        self._show_overlay  = tk.BooleanVar(value=False)
+
+        self._setup_logging()
+        self._build_header()
+        self._build_notebook()
+        self._subscribe_events()
+        self._start_refresh()
+
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._bind_hotkeys()
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    def _setup_logging(self):
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+            handlers=[logging.FileHandler(config.LOG_FILE)],
+        )
+        self._log = logging.getLogger("d3bot")
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    def _build_header(self):
+        hdr = tk.Frame(self._root, bg=ACCENT2, pady=7)
+        hdr.pack(fill="x")
+
+        tk.Label(hdr, text="⚔  DIABLO 3 BOT FRAMEWORK",
+                 font=FONT_TITLE, fg=ACCENT, bg=ACCENT2).pack(side="left", padx=14)
+        tk.Label(hdr, text="Educational / Research Use Only",
+                 font=FONT_SMALL, fg=DIM_FG, bg=ACCENT2).pack(side="left")
+
+        right = tk.Frame(hdr, bg=ACCENT2)
+        right.pack(side="right", padx=14)
+
+        self._phase_lbl = tk.Label(right, text="● IDLE", font=FONT_H2,
+                                   fg=DIM_FG, bg=ACCENT2)
+        self._phase_lbl.pack(side="right", padx=10)
+
+        for text, cmd, bg_col, fg_col, attr in [
+            ("▶  START", self._on_start, GREEN,  "#000", "_start_btn"),
+            ("⏸ PAUSE",  self._on_pause, ORANGE, "#000", "_pause_btn"),
+            ("■  STOP",  self._on_stop,  RED,    TEXT_FG,"_stop_btn"),
+        ]:
+            b = tk.Button(right, text=text, command=cmd, font=("Courier New", 9, "bold"),
+                          bg=bg_col, fg=fg_col, relief="flat", width=10,
+                          cursor="hand2", padx=2)
+            b.pack(side="left", padx=3)
+            setattr(self, attr, b)
+
+        self._update_header_btns()
+
+    # ── Notebook ─────────────────────────────────────────────────────────────
+    def _build_notebook(self):
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("D.TNotebook",     background=DARK_BG, borderwidth=0)
+        style.configure("D.TNotebook.Tab", background=ACCENT2, foreground=TEXT_FG,
+                        padding=[14, 6], font=FONT_SMALL)
+        style.map("D.TNotebook.Tab",
+                  background=[("selected", ACCENT)],
+                  foreground=[("selected", "white")])
+
+        nb = ttk.Notebook(self._root, style="D.TNotebook")
+        nb.pack(fill="both", expand=True, padx=6, pady=4)
+
+        for tab_name, builder in [
+            ("①  Control",  self._build_control_tab),
+            ("②  Features", self._build_features_tab),
+            ("③  Skills",   self._build_skills_tab),
+            ("④  Regions",  self._build_regions_tab),
+            ("⑤  Tools",    self._build_tools_tab),
+            ("⑥  Log",      self._build_log_tab),
+        ]:
+            f = tk.Frame(nb, bg=DARK_BG)
+            nb.add(f, text=tab_name)
+            builder(f)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 1 — CONTROL
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_control_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=2)
+        parent.rowconfigure(0, weight=1)
+
+        left = tk.Frame(parent, bg=DARK_BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(8,4), pady=8)
+
+        # Options
+        opts = frm(left, pady=6)
+        opts.pack(fill="x", pady=(0,8))
+        lbl(opts, "── LAUNCH OPTIONS ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,6))
+        for var, text, tip in [
+            (self._dry_run,       "🧪 Dry Run  (no real inputs)", "Logs all actions instead of executing them"),
+            (self._enable_prof,   "⏱  Enable Profiler",           "Times each feature tick — view in Tools tab"),
+            (self._enable_evtlog, "📝 Log Events to File",         "Saves .jsonl session log to ~/d3bot_sessions/"),
+            (self._show_overlay,  "🖥  In-Game Overlay HUD",       "Transparent always-on-top status window"),
+        ]:
+            row = tk.Frame(opts, bg=PANEL_BG)
+            row.pack(fill="x", padx=10, pady=2)
+            tk.Checkbutton(row, text=text, variable=var, font=FONT_SMALL,
+                           fg=TEXT_FG, bg=PANEL_BG, activebackground=PANEL_BG,
+                           selectcolor=DARK_BG, cursor="hand2",
+                           command=self._on_option_changed).pack(side="left")
+            tk.Label(row, text=tip, font=("Courier New",8), fg=DIM_FG,
+                     bg=PANEL_BG).pack(side="left", padx=6)
+
+        self._dryrun_badge = tk.Label(opts,
+            text="  🧪 DRY RUN — watching but not touching  ",
+            font=("Courier New",9,"bold"), fg="#000", bg=YELLOW, pady=3)
+
+        # Actions
+        acts = frm(left, pady=6)
+        acts.pack(fill="x", pady=(0,8))
+        lbl(acts, "── ACTIONS ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,6))
+        for text, cmd, color in [
+            ("📷 Screenshot",      self._on_screenshot,    ACCENT2),
+            ("🖥  Toggle Overlay",  self._toggle_overlay,   ACCENT2),
+            ("💾 Save Profile",     self._save_profile,     ACCENT2),
+            ("📂 Load Profile",     self._load_profile,     ACCENT2),
+        ]:
+            mkbtn(acts, text, cmd, color=color).pack(pady=2, padx=10, fill="x")
+
+        # Hotkeys
+        hk = frm(left, pady=6)
+        hk.pack(fill="x")
+        lbl(hk, "── HOTKEYS ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,6))
+        for key, desc in [("F5","Start"), ("F6","Pause / Resume"),
+                          ("F7","Stop"),  ("F8","Screenshot"),
+                          ("F9","Toggle Overlay"), ("ESC","Emergency stop")]:
+            r = tk.Frame(hk, bg=PANEL_BG)
+            r.pack(fill="x", padx=10, pady=1)
+            tk.Label(r, text=key, font=("Courier New",9,"bold"), fg=ACCENT,
+                     bg=PANEL_BG, width=6).pack(side="left")
+            tk.Label(r, text=desc, font=FONT_SMALL, fg=DIM_FG,
+                     bg=PANEL_BG).pack(side="left")
+
+        # Right — vitals + stats
+        right = tk.Frame(parent, bg=DARK_BG)
+        right.grid(row=0, column=1, sticky="nsew", padx=(4,8), pady=8)
+
+        # Vitals
+        vitals = frm(right, pady=6)
+        vitals.pack(fill="x", pady=(0,8))
+        lbl(vitals, "── VITALS ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,6))
+        for bar_name, attr in [("Health ❤", "hp_bar"), ("Resource 🔷", "res_bar")]:
+            r = tk.Frame(vitals, bg=PANEL_BG)
+            r.pack(fill="x", padx=12, pady=4)
+            lbl(r, f"{bar_name}:", fg=DIM_FG, font=FONT_SMALL, width=12).pack(side="left")
+            bar = ProgressBar(r, width=360, height=24)
+            bar.pack(side="left")
+            setattr(self, attr, bar)
+
+        # Stats
+        stats_pnl = frm(right, pady=6)
+        stats_pnl.pack(fill="both", expand=True)
+        lbl(stats_pnl, "── SESSION STATS ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,6))
+        STATS = [
+            ("Runtime",         "elapsed"),
+            ("Loops",           "loops"),
+            ("Skills Fired",    "skills_fired"),
+            ("Potions Used",    "potions_used"),
+            ("Items Looted",    "items_looted"),
+            ("Goblins Spotted", "goblins_spotted"),
+            ("Deaths",          "deaths"),
+            ("Rotation Cycles", "rotation_cycles"),
+        ]
+        self._stat_vars: dict[str, tk.StringVar] = {}
+        grid = tk.Frame(stats_pnl, bg=PANEL_BG)
+        grid.pack(fill="x", padx=12)
+        for i, (display, key) in enumerate(STATS):
+            var = tk.StringVar(value="—")
+            self._stat_vars[key] = var
+            row_n, col_n = divmod(i, 2)
+            cell = tk.Frame(grid, bg=PANEL_BG)
+            cell.grid(row=row_n, column=col_n, sticky="w", padx=10, pady=3)
+            tk.Label(cell, text=display+":", font=FONT_SMALL, fg=DIM_FG,
+                     bg=PANEL_BG, width=16, anchor="w").pack(side="left")
+            tk.Label(cell, textvariable=var, font=FONT_MONO, fg=GREEN,
+                     bg=PANEL_BG).pack(side="left", padx=4)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2 — FEATURES
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_features_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+
+        left = frm(parent, pady=6)
+        left.grid(row=0, column=0, sticky="nsew", padx=(8,4), pady=8)
+        lbl(left, "── FEATURE TOGGLES ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,8))
+
+        FEATURES = [
+            ("feat_health",   "💉 Health Monitor",   "Detects HP orb → fires bottomless potion"),
+            ("feat_resource", "🔷 Resource Monitor", "Pauses skills when resource critically low"),
+            ("feat_skills",   "⚡ Skill Rotation",   "Per-skill cooldown tracking and firing"),
+            ("feat_loot",     "💰 Auto Loot",        "Colour-tier beam detection + click pickup"),
+            ("feat_death",    "💀 Death Handler",    "Detects death overlay → auto resurrects"),
+            ("feat_goblin",   "👺 Goblin Detector",  "Purple shimmer scan → alert on detection"),
+            ("feat_antiafk",  "🕹  Anti-AFK",         "Random micro-moves to prevent idle kick"),
+        ]
+        self._feat_vars: dict[str, tk.BooleanVar] = {}
+        for attr, display, desc in FEATURES:
+            var = tk.BooleanVar(value=getattr(self.state, attr))
+            self._feat_vars[attr] = var
+            row = tk.Frame(left, bg=PANEL_BG,
+                           highlightthickness=1, highlightbackground=ACCENT2)
+            row.pack(fill="x", padx=12, pady=3)
+            tk.Checkbutton(row, text=display, variable=var, font=FONT_SMALL,
+                           fg=TEXT_FG, bg=PANEL_BG, activebackground=PANEL_BG,
+                           selectcolor=DARK_BG, cursor="hand2",
+                           command=lambda a=attr, v=var: self._on_feat_toggle(a, v)
+                           ).pack(side="left", padx=6, pady=4)
+            tk.Label(row, text=desc, font=("Courier New",8), fg=DIM_FG,
+                     bg=PANEL_BG).pack(side="left")
+
+        right = frm(parent, pady=6)
+        right.grid(row=0, column=1, sticky="nsew", padx=(4,8), pady=8)
+        lbl(right, "── THRESHOLDS ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,8))
+
+        self._sliders: dict[str, tk.Scale] = {}
+        SLIDERS = [
+            ("Health Potion Threshold %",  "HEALTH_THRESHOLD",    1,  90,  int(config.HEALTH_THRESHOLD*100)),
+            ("Resource Pause Threshold %", "RESOURCE_THRESHOLD",  1,  90,  int(config.RESOURCE_THRESHOLD*100)),
+            ("Loot Scan Radius (px)",      "LOOT_RADIUS_PX",     20, 300,  config.LOOT_RADIUS_PX),
+            ("Max Runtime (minutes)",      "MAX_RUNTIME_MINUTES", 10, 480,  config.MAX_RUNTIME_MINUTES),
+            ("Main Loop Interval (ms)",    "_loop_ms",            10, 500,  int(config.LOOP_INTERVAL * 1000)),
+        ]
+        for display, key, lo, hi, default in SLIDERS:
+            f = tk.Frame(right, bg=PANEL_BG)
+            f.pack(fill="x", padx=12, pady=5)
+            lbl(f, display, fg=DIM_FG, font=FONT_SMALL).pack(anchor="w")
+            s = tk.Scale(f, from_=lo, to=hi, orient="horizontal",
+                         font=FONT_SMALL, bg=PANEL_BG, fg=TEXT_FG,
+                         troughcolor=BAR_BG, activebackground=ACCENT,
+                         highlightthickness=0, length=310,
+                         command=lambda v, k=key: self._on_slider(k, v))
+            s.set(default)
+            s.pack(fill="x")
+            self._sliders[key] = s
+
+        lbl(right, "── LOOT TIER PRIORITIES ──", font=FONT_H2, fg=ACCENT).pack(pady=(12,4))
+        lbl(right, "Only tiers ticked here will be picked up.", fg=DIM_FG, font=FONT_SMALL).pack(padx=12, anchor="w")
+        self._loot_vars: dict[str, tk.BooleanVar] = {}
+        for tier, color in [("legendary","#ffa726"),("set","#00d68f"),
+                            ("rare","#ffe082"),("magic","#8888ff")]:
+            var = tk.BooleanVar(value=tier in config.LOOT_PRIORITIES)
+            self._loot_vars[tier] = var
+            tk.Checkbutton(right, text=f"  ■  {tier.capitalize()}", variable=var,
+                           font=("Courier New",10,"bold"), fg=color, bg=PANEL_BG,
+                           activebackground=PANEL_BG, selectcolor=DARK_BG,
+                           command=self._update_loot_priorities
+                           ).pack(anchor="w", padx=12, pady=2)
+
+    def _on_feat_toggle(self, attr, var):
+        setattr(self.state, attr, var.get())
+        bus.publish(EventBus.FEATURE_TOGGLED, {"feature": attr, "value": var.get()})
+
+    def _on_slider(self, key, val):
+        v = int(val)
+        if key == "HEALTH_THRESHOLD":     config.HEALTH_THRESHOLD    = v / 100
+        elif key == "RESOURCE_THRESHOLD": config.RESOURCE_THRESHOLD  = v / 100
+        elif key == "LOOT_RADIUS_PX":     config.LOOT_RADIUS_PX      = v
+        elif key == "MAX_RUNTIME_MINUTES":config.MAX_RUNTIME_MINUTES = v
+        elif key == "_loop_ms":           config.LOOP_INTERVAL       = v / 1000
+
+    def _update_loot_priorities(self):
+        config.LOOT_PRIORITIES = [t for t, v in self._loot_vars.items() if v.get()]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 — SKILLS
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_skills_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+
+        left = frm(parent, pady=6)
+        left.grid(row=0, column=0, sticky="nsew", padx=(8,4), pady=8)
+        lbl(left, "── SKILL ROTATION EDITOR ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,4))
+
+        hdr = tk.Frame(left, bg=PANEL_BG)
+        hdr.pack(fill="x", padx=12)
+        for col_text, w in [("#",3),("Key",4),("CD (s)",7),("Skill Label",20)]:
+            tk.Label(hdr, text=col_text, font=FONT_SMALL, fg=DIM_FG,
+                     bg=PANEL_BG, width=w, anchor="w").pack(side="left", padx=2)
+
+        self._skill_rows: list[SkillRow] = []
+        for i, (key, cd, label_text) in enumerate(config.DEFAULT_SKILL_ROTATION):
+            row = SkillRow(left, i, key, cd, label_text)
+            row.pack(fill="x", padx=12, pady=1)
+            self._skill_rows.append(row)
+
+        btn_row = tk.Frame(left, bg=PANEL_BG)
+        btn_row.pack(pady=(8,4))
+        mkbtn(btn_row, "↺  Apply Skills", self._apply_skills, color=GREEN, fg="#000").pack(side="left", padx=4)
+        mkbtn(btn_row, "⟳  Reset Defaults", self._reset_skills, color=ACCENT2).pack(side="left", padx=4)
+
+        lbl(left, "Set CD=0 for spammable primaries. CD is in seconds.",
+            fg=DIM_FG, font=FONT_SMALL).pack(pady=(4,2), padx=12, anchor="w")
+        lbl(left, "Key = keyboard key sent to game (1–6, q, e, r…)",
+            fg=DIM_FG, font=FONT_SMALL).pack(padx=12, anchor="w")
+
+        # Right — presets
+        right = frm(parent, pady=6)
+        right.grid(row=0, column=1, sticky="nsew", padx=(4,8), pady=8)
+        lbl(right, "── CLASS BUILD PRESETS ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,8))
+
+        lb_frame = tk.Frame(right, bg=PANEL_BG)
+        lb_frame.pack(fill="both", expand=True, padx=12)
+        sb = tk.Scrollbar(lb_frame)
+        sb.pack(side="right", fill="y")
+        self._preset_lb = tk.Listbox(
+            lb_frame, font=FONT_SMALL, bg=BAR_BG, fg=TEXT_FG,
+            selectbackground=ACCENT, activestyle="none",
+            yscrollcommand=sb.set, height=9,
+            highlightthickness=1, highlightbackground=ACCENT2,
+        )
+        for name in list_presets():
+            self._preset_lb.insert(tk.END, name)
+        self._preset_lb.pack(fill="both", expand=True)
+        sb.config(command=self._preset_lb.yview)
+        self._preset_lb.bind("<<ListboxSelect>>", self._on_preset_select)
+
+        lbl(right, "Preset notes:", fg=DIM_FG, font=FONT_SMALL).pack(anchor="w", padx=12, pady=(6,0))
+        self._preset_notes = scrolledtext.ScrolledText(
+            right, height=7, font=FONT_SMALL, bg=BAR_BG, fg=DIM_FG,
+            state="disabled", relief="flat", wrap="word",
+        )
+        self._preset_notes.pack(fill="x", padx=12, pady=4)
+        mkbtn(right, "✔  Load Preset", self._load_preset, color=GREEN, fg="#000").pack(pady=4)
+
+    def _on_preset_select(self, event):
+        sel = self._preset_lb.curselection()
+        if not sel:
+            return
+        name   = self._preset_lb.get(sel[0])
+        preset = PRESETS.get(name, {})
+        notes  = (f"Class:    {preset.get('class','—')}\n"
+                  f"Resource: {preset.get('resource_type','—')}\n\n"
+                  f"{preset.get('notes','')}")
+        self._preset_notes.configure(state="normal")
+        self._preset_notes.delete("1.0", tk.END)
+        self._preset_notes.insert(tk.END, notes)
+        self._preset_notes.configure(state="disabled")
+
+    def _load_preset(self):
+        sel = self._preset_lb.curselection()
+        if not sel:
+            messagebox.showinfo("Presets", "Select a preset from the list first.")
+            return
+        name   = self._preset_lb.get(sel[0])
+        preset = PRESETS.get(name, {})
+        apply_preset(name)
+        skills = preset.get("skill_rotation", config.DEFAULT_SKILL_ROTATION)
+        for i, row in enumerate(self._skill_rows):
+            if i < len(skills):
+                row.set_values(*skills[i])
+            else:
+                row.set_values("", 0.0, "—")
+        if self.engine:
+            self.engine.update_skills(skills)
+        self._log.info("Preset loaded: %s", name)
+
+    def _apply_skills(self):
+        skills = [r.get() for r in self._skill_rows]
+        config.DEFAULT_SKILL_ROTATION = skills
+        if self.engine:
+            self.engine.update_skills(skills)
+
+    def _reset_skills(self):
+        from importlib import reload
+        import config as _c
+        reload(_c)
+        for i, (key, cd, lt) in enumerate(_c.DEFAULT_SKILL_ROTATION):
+            if i < len(self._skill_rows):
+                self._skill_rows[i].set_values(key, cd, lt)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 4 — REGIONS
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_regions_tab(self, parent):
+        self._region_editor = RegionEditor(parent)
+        self._region_editor.pack(fill="both", expand=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 5 — TOOLS
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_tools_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+
+        left = frm(parent, pady=6)
+        left.grid(row=0, column=0, sticky="nsew", padx=(8,4), pady=8)
+        lbl(left, "── EXTERNAL TOOLS ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,8))
+
+        tools = [
+            ("🎨 HSV Calibrator",
+             "tools/calibration_tool.py",
+             "Drag HSV sliders on a live screenshot.\nIsolate any colour → press S to print config values."),
+            ("🔍 Detection Visualizer",
+             "tools/detection_visualizer.py",
+             "Live OpenCV window — see all detection regions,\nfilled bars, loot blobs, goblin highlights in real time."),
+            ("✂️  Template Capture",
+             "tools/template_capture.py",
+             "Draw rectangle over any UI element.\nSaved PNG is auto-loaded by ImageRecognizer."),
+            ("📊 Session Log Analyser",
+             None,
+             "Load a .jsonl session log → see event counts,\nrates per hour, CSV export for pandas/LibreOffice."),
+        ]
+        for tool_name, script, desc in tools:
+            pnl = tk.Frame(left, bg=BAR_BG, pady=6, padx=10,
+                           highlightthickness=1, highlightbackground=ACCENT2)
+            pnl.pack(fill="x", padx=12, pady=4)
+            tk.Label(pnl, text=tool_name, font=("Courier New",10,"bold"),
+                     fg=ACCENT, bg=BAR_BG).pack(anchor="w")
+            tk.Label(pnl, text=desc, font=FONT_SMALL, fg=DIM_FG,
+                     bg=BAR_BG, justify="left").pack(anchor="w", pady=2)
+            cmd = (lambda s=script: self._launch_tool(s)) if script else self._launch_analyser
+            mkbtn(pnl, "▶  Launch", cmd, color=ACCENT2, w=12).pack(anchor="e", pady=(2,0))
+
+        right = frm(parent, pady=6)
+        right.grid(row=0, column=1, sticky="nsew", padx=(4,8), pady=8)
+        lbl(right, "── PROFILER READOUT ──", font=FONT_H2, fg=ACCENT).pack(pady=(4,4))
+        lbl(right,
+            "Tick 'Enable Profiler' on Control tab.\nStart bot → run for a bit → click Refresh.",
+            fg=DIM_FG, font=FONT_SMALL).pack(padx=12, pady=(0,6), anchor="w")
+
+        self._prof_text = tk.Text(right, height=18, font=FONT_LOG,
+                                  bg=BAR_BG, fg=GREEN, relief="flat", state="disabled")
+        self._prof_text.pack(fill="both", expand=True, padx=12, pady=4)
+        mkbtn(right, "↺  Refresh Profiler", self._refresh_profiler, color=ACCENT2).pack(pady=4)
+
+    def _launch_tool(self, script):
+        try:
+            subprocess.Popen([sys.executable, script],
+                             cwd=os.path.dirname(os.path.abspath(__file__)))
+        except Exception as e:
+            messagebox.showerror("Launch Error", str(e))
+
+    def _launch_analyser(self):
+        path = filedialog.askopenfilename(
+            initialdir=os.path.expanduser("~/d3bot_sessions"),
+            title="Select session log",
+            filetypes=[("JSON Lines","*.jsonl"),("All","*")],
+        )
+        if path:
+            subprocess.Popen([sys.executable, "tools/event_replay_logger.py", path],
+                             cwd=os.path.dirname(os.path.abspath(__file__)))
+
+    def _refresh_profiler(self):
+        if not self.engine:
+            self._set_prof("Start the bot first.")
+            return
+        rows = self.engine.get_profiler_report()
+        if not rows or not any(r.get("count") for r in rows):
+            self._set_prof("Profiler not enabled.\nTick 'Enable Profiler' on Control tab, restart bot.")
+            return
+        lines = [f"{'Feature':<22} {'Calls':>6} {'Mean':>8} {'Max':>8} {'Spikes':>7}",
+                 "─" * 58]
+        for r in sorted(rows, key=lambda x: -x.get("total_ms", 0)):
+            if not r.get("count"):
+                continue
+            sp = f"⚠ {r['spikes']}" if r.get("spikes") else "—"
+            lines.append(f"{r['name']:<22} {r['count']:>6} "
+                         f"{r['mean_ms']:>5.2f}ms {r['max_ms']:>5.2f}ms {sp:>7}")
+        self._set_prof("\n".join(lines))
+
+    def _set_prof(self, text):
+        self._prof_text.configure(state="normal")
+        self._prof_text.delete("1.0", tk.END)
+        self._prof_text.insert(tk.END, text)
+        self._prof_text.configure(state="disabled")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 6 — LOG
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_log_tab(self, parent):
+        toolbar = tk.Frame(parent, bg=DARK_BG)
+        toolbar.pack(fill="x", padx=8, pady=6)
+        mkbtn(toolbar, "Clear",         self._clear_log,      w=10, color=ACCENT2).pack(side="left")
+        mkbtn(toolbar, "Open Log File", self._open_log_file,  w=14, color=ACCENT2).pack(side="left", padx=4)
+
+        self._log_widget = scrolledtext.ScrolledText(
+            parent, font=FONT_LOG, bg=BAR_BG, fg=TEXT_FG,
+            insertbackground=TEXT_FG, relief="flat", state="disabled",
+        )
+        self._log_widget.pack(fill="both", expand=True, padx=8, pady=(0,8))
+
+        handler = GuiLogHandler(self._log_widget)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+        logging.getLogger("d3bot").addHandler(handler)
+        self._log_widget.tag_config("DRYRUN", foreground=YELLOW)
+
+        def _on_dryrun(desc):
+            try:
+                self._log_widget.configure(state="normal")
+                self._log_widget.insert(tk.END, f"[DRY RUN] {desc}\n", "DRYRUN")
+                self._log_widget.see(tk.END)
+                self._log_widget.configure(state="disabled")
+            except tk.TclError:
+                pass
+        bus.subscribe(DRYRUN_EVENT, lambda d: self._root.after(0, lambda: _on_dryrun(d)))
+
+    def _clear_log(self):
+        self._log_widget.configure(state="normal")
+        self._log_widget.delete("1.0", tk.END)
+        self._log_widget.configure(state="disabled")
+
+    def _open_log_file(self):
+        try:
+            subprocess.Popen(["xdg-open", config.LOG_FILE])
+        except Exception:
+            messagebox.showinfo("Log", config.LOG_FILE)
+
+    # ── Event bus ─────────────────────────────────────────────────────────────
+    def _subscribe_events(self):
+        def _a(fn):
+            return lambda d=None: self._root.after(0, lambda v=d: fn(v))
+
+        bus.subscribe(EventBus.BOT_STARTED,        _a(lambda _: self._update_header_btns()))
+        bus.subscribe(EventBus.BOT_STOPPED,         _a(lambda _: self._on_engine_stopped()))
+        bus.subscribe(EventBus.PLAYER_DIED,         _a(lambda d: self._log.warning("💀 Died (total: %s)", d)))
+        bus.subscribe(EventBus.PLAYER_RESURRECTED,  _a(lambda _: self._log.info("✅ Resurrected")))
+        bus.subscribe(EventBus.POTION_USED,         _a(lambda p: self._log.info("💊 Potion at %.0f%%", p*100) if p else None))
+        bus.subscribe(EventBus.GOBLIN_DETECTED,     _a(lambda n: self._log.info("👺 GOBLIN SPOTTED! (#%s)", n)))
+        bus.subscribe(EventBus.LOOT_COLLECTED,      _a(lambda d: self._log.info("💰 %s at (%s,%s)", d.get("tier"), d.get("x"), d.get("y"))))
+        bus.subscribe(EventBus.LOW_HEALTH,          _a(lambda p: self._log.warning("⚠ Low HP: %.0f%%", p*100) if p else None))
+        bus.subscribe(EventBus.RUNTIME_LIMIT,       _a(lambda _: self._log.info("⏱ Runtime limit reached")))
+
+    # ── Refresh ───────────────────────────────────────────────────────────────
+    def _start_refresh(self):
+        self._refresh()
+
+    def _refresh(self):
+        try:
+            snap  = self.state.snapshot()
+            phase = snap["phase"]
+            stats = snap["stats"]
+            colors = {"RUNNING": GREEN, "PAUSED": ORANGE, "IDLE": DIM_FG,
+                      "DEAD": RED, "RESURRECTING": ORANGE, "STOPPING": RED}
+            self._phase_lbl.config(text=f"● {phase}", fg=colors.get(phase, DIM_FG))
+            self.hp_bar.set(snap.get("health_pct"))
+            self.res_bar.set(snap.get("resource_pct"))
+            for key, var in self._stat_vars.items():
+                var.set(str(stats.get(key, "—")))
+        except Exception:
+            pass
+        self._root.after(400, self._refresh)
+
+    # ── Option / control handlers ─────────────────────────────────────────────
+    def _on_option_changed(self):
+        if self._show_overlay.get():
+            self._open_overlay()
+        else:
+            self._close_overlay()
+        if self._dry_run.get():
+            self._dryrun_badge.pack(pady=4, padx=10, fill="x")
+        else:
+            self._dryrun_badge.pack_forget()
+
+    def _update_header_btns(self):
+        phase   = self.state.get_phase()
+        running = phase in (BotPhase.RUNNING, BotPhase.PAUSED,
+                            BotPhase.DEAD, BotPhase.RESURRECTING)
+        self._start_btn.config(state="disabled" if running else "normal")
+        self._pause_btn.config(state="normal"   if running else "disabled")
+        self._stop_btn.config( state="normal"   if running else "disabled")
+
+    def _on_engine_stopped(self):
+        self.state.set_phase(BotPhase.IDLE)
+        self._update_header_btns()
+
+    def _on_start(self):
+        if self.state.get_phase() != BotPhase.IDLE:
+            return
+        override = DryRunController() if self._dry_run.get() else None
+        self.engine = BotEngine(
+            self.state,
+            enable_profiler=self._enable_prof.get(),
+            enable_event_log=self._enable_evtlog.get(),
+            input_override=override,
+        )
+        self._apply_skills()
+        self.engine.start()
+        self._update_header_btns()
+        mode = "DRY RUN 🧪" if self._dry_run.get() else "LIVE"
+        self._log.info("🚀 Bot started — %s", mode)
+
+    def _on_pause(self):
+        if not self.engine:
+            return
+        phase = self.state.get_phase()
+        if phase == BotPhase.RUNNING:
+            self.engine.pause()
+            self._log.info("⏸ Paused")
+        elif phase == BotPhase.PAUSED:
+            self.engine.resume()
+            self._log.info("▶ Resumed")
+
+    def _on_stop(self):
+        if self.engine:
+            self.engine.stop()
+            self.engine = None
+            self._log.info("■ Bot stopped")
+
+    def _on_screenshot(self):
+        if self.engine:
+            path = self.engine.take_screenshot()
+        else:
+            from io.screen_capture import ScreenCapture
+            path = ScreenCapture().save_screenshot()
+        self._log.info("📷 Screenshot saved: %s", path)
+
+    def _toggle_overlay(self):
+        self._show_overlay.set(not self._show_overlay.get())
+        self._on_option_changed()
+
+    def _open_overlay(self):
+        if self._overlay and self._overlay.winfo_exists():
+            return
+        self._overlay = OverlayHUD(self._root, self.state)
+        self._log.info("🖥 Overlay opened — drag it over your game window")
+
+    def _close_overlay(self):
+        if self._overlay:
+            try:
+                self._overlay.destroy()
+            except tk.TclError:
+                pass
+            self._overlay = None
+
+    def _save_profile(self):
+        name = askstring("Save Profile", "Profile name:", parent=self._root)
+        if name:
+            ProfileManager().save(name)
+            self._log.info("Profile saved: %s", name)
+
+    def _load_profile(self):
+        pm = ProfileManager()
+        profiles = pm.list_profiles()
+        if not profiles:
+            messagebox.showinfo("Profiles", "No saved profiles found.")
+            return
+        name = askstring("Load Profile",
+                         "Available:\n  " + "\n  ".join(profiles) + "\n\nName:",
+                         parent=self._root)
+        if name and pm.load(name):
+            self._log.info("Profile loaded: %s", name)
+            self._reset_skills()
+
+    def _bind_hotkeys(self):
+        self._root.bind("<F5>",    lambda _: self._on_start())
+        self._root.bind("<F6>",    lambda _: self._on_pause())
+        self._root.bind("<F7>",    lambda _: self._on_stop())
+        self._root.bind("<F8>",    lambda _: self._on_screenshot())
+        self._root.bind("<F9>",    lambda _: self._toggle_overlay())
+        self._root.bind("<Escape>",lambda _: self._on_stop())
+
+    def _on_close(self):
+        self._on_stop()
+        self._close_overlay()
+        self._root.destroy()
+
+    def run(self):
+        self._root.mainloop()
+
+
+def main():
+    print("\n" + "═" * 54)
+    print("  D3 Bot Framework — Educational / Research Use Only")
+    print("═" * 54)
+    print("  WARNING: Game automation may violate Blizzard ToS.")
+    print("═" * 54 + "\n")
+    D3BotApp().run()
+
+
+if __name__ == "__main__":
+    main()
