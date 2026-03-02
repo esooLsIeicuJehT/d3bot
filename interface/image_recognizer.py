@@ -15,7 +15,7 @@ except ImportError:
     CV2_AVAILABLE = False
 
 import config
-from io.screen_capture import ScreenCapture, Region
+from interface.screen_capture import ScreenCapture, Region
 
 
 LootHit = Tuple[int, int, str]   # (x, y, tier_name)

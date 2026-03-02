@@ -36,7 +36,7 @@ except ImportError:
     print("OpenCV not found. Run:  pip install opencv-python")
     sys.exit(1)
 
-from io.screen_capture import ScreenCapture
+from interface.screen_capture import ScreenCapture
 
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "templates")
 WIN = "Template Capture — Draw rectangle, then press S to save | R=refresh | Q=quit"

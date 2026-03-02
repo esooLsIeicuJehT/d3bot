@@ -31,7 +31,7 @@ except ImportError:
     print("OpenCV not found. Run:  pip install opencv-python")
     sys.exit(1)
 
-from io.screen_capture import ScreenCapture
+from interface.screen_capture import ScreenCapture
 
 
 # ── Slider state ─────────────────────────────────────────────────────────────

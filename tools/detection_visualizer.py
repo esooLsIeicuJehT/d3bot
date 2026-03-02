@@ -32,8 +32,8 @@ except ImportError:
     sys.exit(1)
 
 import config
-from io.screen_capture import ScreenCapture
-from io.image_recognizer import ImageRecognizer
+from interface.screen_capture import ScreenCapture
+from interface.image_recognizer import ImageRecognizer
 
 
 WIN = "D3 Bot — Detection Visualizer   Q=quit  S=save  SPACE=pause"

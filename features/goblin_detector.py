@@ -8,7 +8,7 @@ import time
 
 from core.state import BotState
 from core.event_bus import EventBus, bus
-from io.image_recognizer import ImageRecognizer
+from interface.image_recognizer import ImageRecognizer
 
 
 class GoblinDetector:

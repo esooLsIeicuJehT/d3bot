@@ -11,7 +11,7 @@ from typing import List, Tuple
 import config
 from core.state import BotState
 from core.event_bus import EventBus, bus
-from io.input_controller import InputController
+from interface.input_controller import InputController
 
 
 SkillDef = Tuple[str, float, str]   # (key, cooldown, label)

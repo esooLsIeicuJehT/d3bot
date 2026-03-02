@@ -12,7 +12,7 @@ import config
 from core.state import BotState, BotPhase
 from core.event_bus import EventBus, bus
 
-# Renamed from 'io' to 'interface' to fix Python built-in module conflict
+# Updated from 'io' to 'interface'
 from interface.screen_capture import ScreenCapture
 from interface.image_recognizer import ImageRecognizer
 from interface.input_controller import InputController

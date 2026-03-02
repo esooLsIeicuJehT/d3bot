@@ -9,8 +9,8 @@ import time
 import config
 from core.state import BotState
 from core.event_bus import EventBus, bus
-from io.image_recognizer import ImageRecognizer
-from io.input_controller import InputController
+from interface.image_recognizer import ImageRecognizer
+from interface.input_controller import InputController
 
 
 class HealthMonitor:

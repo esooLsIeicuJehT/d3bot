@@ -74,7 +74,7 @@ class ProgressBar(tk.Canvas):
     def __init__(self, parent, width=260, height=20, **kw):
         super().__init__(parent, width=width, height=height, bg=BAR_BG,
                          highlightthickness=1, highlightbackground=ACCENT2, **kw)
-        self._max_width = width  # Renamed to avoid clashing with tkinter internals
+        self._w   = width
         self._bar = self.create_rectangle(0, 0, 0, height, fill=GREEN, outline="")
         self._txt = self.create_text(width // 2, height // 2, text="—",
                                      fill=TEXT_FG, font=FONT_SMALL)
@@ -84,7 +84,7 @@ class ProgressBar(tk.Canvas):
             self.itemconfig(self._txt, text="N/A")
             self.coords(self._bar, 0, 0, 0, self["height"])
             return
-        w = int(self._max_width * max(0.0, min(1.0, pct)))
+        w = int(self._w * max(0.0, min(1.0, pct)))
         c = GREEN if pct > 0.5 else (ORANGE if pct > 0.25 else RED)
         self.coords(self._bar, 0, 0, w, self["height"])
         self.itemconfig(self._bar, fill=c)

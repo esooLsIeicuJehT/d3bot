@@ -8,7 +8,7 @@ import time
 import random
 
 from core.state import BotState
-from io.input_controller import InputController
+from interface.input_controller import InputController
 import config
 
 

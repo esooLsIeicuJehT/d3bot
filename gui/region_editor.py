@@ -26,7 +26,7 @@ except ImportError:
     PIL_OK = False
 
 import config
-from io.screen_capture import ScreenCapture
+from interface.screen_capture import ScreenCapture
 
 CANVAS_W = 800
 CANVAS_H = 450
